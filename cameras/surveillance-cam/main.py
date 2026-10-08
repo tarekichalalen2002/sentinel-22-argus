@@ -1,24 +1,35 @@
-"""Optical-flow movers → stable borders (2/4 frames) → DINOv3 classify → label next 4.
+"""Optical-flow movers → stable borders → DINOv3 classify → Sentinel alerts.
 
-Usage:
-  python surveillance-cam/main.py --source path/to/video.mp4
-  python surveillance-cam/main.py --source path/to/video.mp4 --save output/flow_dino.mp4
+Usage (keys / source are prompted interactively):
+  python surveillance-cam/main.py claim
+  python surveillance-cam/main.py run
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from dino_classifier import Dinov3Classifier
+from motion_alerts import MotionAlertAggregator
 from stable_tracks import StabilityWindow, LabeledRegion, iou
+from common.prompts import ask_video_or_webcam, ask_yes_no
+from common.server_client import SentinelClient, SentinelClientError, bgr_to_jpeg_b64
 
 WINDOW = 6
 MIN_HITS = 3
+DEFAULT_SERVER = "http://localhost:3000"
+ALERT_WINDOW_SEC = 10.0
+HUMAN_RATIO = 0.03
+ANIMAL_RATIO = 0.05
 
 
 def parse_source(source: str) -> str | int:
@@ -32,21 +43,16 @@ def parse_source(source: str) -> str | int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Optical-flow + stable borders + DINOv3 classification"
+        description="Optical-flow + DINOv3 surveillance camera linked to Sentinel"
     )
-    p.add_argument("--source", required=True, help="MP4 path or webcam index")
-    p.add_argument("--magnitude", type=float, default=1.0)
-    p.add_argument("--min-area", type=int, default=500)
-    p.add_argument("--window", type=int, default=WINDOW)
-    p.add_argument("--min-hits", type=int, default=MIN_HITS)
-    p.add_argument(
-        "--dino-model",
-        default="vit_small_patch16_dinov3.lvd1689m",
-        help="Smallest usable DINOv3 (ViT-S/16 via timm)",
-    )
-    p.add_argument("--save", default=None)
-    p.add_argument("--device", default=None)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("claim", help="Register this device (prompts for access key)")
+    sub.add_parser("run", help="Live surveillance (prompts for source / keys)")
     return p
+
+
+def register_camera(client: SentinelClient, *, claim_mode: bool = False) -> None:
+    client.require_active(offer_reregister=claim_mode)
 
 
 def motion_boxes(
@@ -199,8 +205,9 @@ def run_video(
     min_hits: int = MIN_HITS,
     dino_model: str = "vit_small_patch16_dinov3.lvd1689m",
     device: str | None = None,
-    window_title: str = "Optical flow + DINOv3 (q/ESC quit)",
+    window_title: str = "Surveillance-cam — Sentinel (q/ESC quit)",
     classifier: Dinov3Classifier | None = None,
+    on_alert: Callable[[dict, np.ndarray], None] | None = None,
 ) -> list[dict]:
     """Run optical-flow → stable borders → DINOv3 on one video. Returns event dicts."""
     import json
@@ -280,6 +287,11 @@ def run_video(
                         if events_fp is not None:
                             events_fp.write(json.dumps(event) + "\n")
                             events_fp.flush()
+                        if on_alert is not None:
+                            try:
+                                on_alert(event, frame)
+                            except Exception as exc:
+                                print(f"Alert callback failed: {exc}", file=sys.stderr)
                     collect.reset()
                     phase = "display"
                     display_left = window
@@ -333,26 +345,110 @@ def run_video(
     return events
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def cmd_claim(_args: argparse.Namespace) -> int:
+    client = SentinelClient(DEFAULT_SERVER, token_name="surveillance")
     try:
-        source = parse_source(args.source)
+        register_camera(client, claim_mode=True)
+    except SentinelClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    cam = client.camera or {}
+    print(f"Ready. Camera id={cam.get('id')} name={cam.get('name')} type={cam.get('type')}")
+    return 0
+
+
+def cmd_run(_args: argparse.Namespace) -> int:
+    offline = ask_yes_no("Run offline (no dashboard alerts)?", default=False)
+    source_raw = ask_video_or_webcam(webcam_default="0")
+    try:
+        source = parse_source(source_raw)
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
         return 1
+    if isinstance(source, str):
+        print(f"Playing local video: {source}", file=sys.stderr)
+    else:
+        print(f"Using webcam index: {source}", file=sys.stderr)
+
+    on_alert = None
+    if not offline:
+        client = SentinelClient(DEFAULT_SERVER, token_name="surveillance")
+        try:
+            register_camera(client)
+        except SentinelClientError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+
+        upload_snaps = ask_yes_no("Upload alert snapshots?", default=True)
+
+        def send_aggregated(payload: dict) -> None:
+            try:
+                client.post_alert(
+                    category=payload["category"],
+                    label=payload.get("label") or "",
+                    confidence=float(payload.get("confidence") or 0),
+                    box=payload.get("box"),
+                    snapshot_b64=payload.get("snapshot_b64"),
+                )
+                print(
+                    f"→ alert sent (10s window): {payload['category']} / "
+                    f"{payload.get('label')} "
+                    f"[human={payload.get('human_share', 0):.0%} "
+                    f"animal={payload.get('animal_share', 0):.0%} of "
+                    f"{payload.get('window_samples', 0)}]",
+                    file=sys.stderr,
+                )
+            except SentinelClientError as exc:
+                print(f"Failed to post alert: {exc}", file=sys.stderr)
+
+        aggregator = MotionAlertAggregator(
+            send_aggregated,
+            window_sec=ALERT_WINDOW_SEC,
+            human_ratio=HUMAN_RATIO,
+            animal_ratio=ANIMAL_RATIO,
+        )
+
+        def on_alert(event: dict, frame: np.ndarray) -> None:
+            box = event.get("bbox")
+            box_t = tuple(int(v) for v in box) if box and len(box) == 4 else None
+            crop_b64 = None
+            if upload_snaps and box_t is not None:
+                x, y, w, h = box_t
+                fh, fw = frame.shape[:2]
+                x1, y1 = max(0, x), max(0, y)
+                x2, y2 = min(fw, x + w), min(fh, y + h)
+                if x2 > x1 and y2 > y1:
+                    crop_b64 = bgr_to_jpeg_b64(frame[y1:y2, x1:x2])
+            aggregator.add(
+                category=str(event.get("category") or "unknown object"),
+                label=event.get("label") or "",
+                confidence=float(event.get("confidence") or 0),
+                box=box_t,
+                snapshot_b64=crop_b64,
+            )
 
     run_video(
         source,
-        save=args.save,
         display=True,
-        magnitude=args.magnitude,
-        min_area=args.min_area,
-        window=args.window,
-        min_hits=args.min_hits,
-        dino_model=args.dino_model,
-        device=args.device,
+        magnitude=1.0,
+        min_area=500,
+        window=WINDOW,
+        min_hits=MIN_HITS,
+        on_alert=on_alert,
     )
+    if on_alert is not None:
+        aggregator.flush()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "claim":
+        return cmd_claim(args)
+    if args.command == "run":
+        return cmd_run(args)
+    print(f"Unknown command: {args.command}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

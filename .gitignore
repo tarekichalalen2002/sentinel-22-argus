@@ -13,3 +13,10 @@ MoCa/
 data/
 server/.env
 server/node_modules/
+*/node_modules/
+node_modules/
+cameras/.tokens/
+frontend/dist/
+frontend/node_modules/
+server/static/
+

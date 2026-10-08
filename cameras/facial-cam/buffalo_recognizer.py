@@ -43,10 +43,14 @@ class BuffaloRecognizer:
             raise RuntimeError(f"No recognition model in pack {model_name}")
 
         self.identities: dict[str, np.ndarray] = {}
-        self._load_gallery()
+        self.statuses: dict[str, str] = {}
+        # Load local folder if it has identities; server sync may replace these.
+        if self.gallery_dir.is_dir() and any(self.gallery_dir.iterdir()):
+            self._load_gallery()
 
     def _load_gallery(self) -> None:
         self.identities.clear()
+        self.statuses.clear()
         for user_dir in sorted(p for p in self.gallery_dir.iterdir() if p.is_dir()):
             embs: list[np.ndarray] = []
             for img_path in sorted(user_dir.iterdir()):
@@ -64,6 +68,7 @@ class BuffaloRecognizer:
             mean = np.mean(np.stack(embs, axis=0), axis=0)
             mean = mean / (np.linalg.norm(mean) + 1e-8)
             self.identities[user_dir.name] = mean.astype(np.float32)
+            self.statuses[user_dir.name] = "authorized"
             print(
                 f"  enrolled {user_dir.name}: {len(embs)} image(s)",
                 file=sys.stderr,
@@ -118,8 +123,67 @@ class BuffaloRecognizer:
                 best_name = name
 
         if best_sim >= self.threshold:
-            return "authorized", best_name, best_sim
+            status = self.statuses.get(best_name or "", "authorized")
+            if status == "authorized":
+                return "authorized", best_name, best_sim
+            # Known face, not yet approved on the dashboard.
+            return "unauthorized", best_name, best_sim
         return "unauthorized", None, best_sim
+
+    def set_identities_from_embeddings(
+        self,
+        users: list[dict],
+        *,
+        decode_face=None,
+    ) -> int:
+        """Replace gallery from server payloads: {username, embedding?, faceImage?, status?}."""
+        self.identities.clear()
+        self.statuses.clear()
+        loaded = 0
+        authorized = 0
+        for user in users:
+            name = user.get("username")
+            if not name:
+                continue
+            emb = user.get("embedding")
+            vec: np.ndarray | None = None
+            if isinstance(emb, list) and len(emb) > 0:
+                vec = np.asarray(emb, dtype=np.float32).ravel()
+                norm = float(np.linalg.norm(vec))
+                if norm > 1e-8:
+                    vec = vec / norm
+                else:
+                    vec = None
+            if vec is None and user.get("faceImage") and decode_face is not None:
+                bgr = decode_face(user["faceImage"])
+                if bgr is not None:
+                    vec = self.embed_bgr(bgr)
+            if vec is None:
+                print(f"  skip {name}: no usable embedding/faceImage", file=sys.stderr)
+                continue
+            status = str(user.get("status") or "enrolled")
+            self.identities[str(name)] = vec.astype(np.float32)
+            self.statuses[str(name)] = status
+            loaded += 1
+            if status == "authorized":
+                authorized += 1
+            print(f"  server {name}: status={status}", file=sys.stderr)
+        print(
+            f"Server gallery ready: {loaded} face(s), {authorized} authorized",
+            file=sys.stderr,
+        )
+        if loaded and authorized == 0:
+            print(
+                "No authorized users yet — authorize enrolled users on the dashboard "
+                "for access to be granted.",
+                file=sys.stderr,
+            )
+        if loaded == 0:
+            print(
+                "Server gallery empty — enroll a user, then Authorize them on the dashboard.",
+                file=sys.stderr,
+            )
+        return loaded
 
     @property
     def enrolled_users(self) -> list[str]:

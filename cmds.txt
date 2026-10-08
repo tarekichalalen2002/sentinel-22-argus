@@ -1,0 +1,5 @@
+python facial-cam/main.py claim
+python facial-cam/main.py enroll
+python facial-cam/main.py run
+python surveillance-cam/main.py claim
+python surveillance-cam/main.py run

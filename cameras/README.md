@@ -1,50 +1,44 @@
-# Sentinel
+# Sentinel cameras
 
-Two camera pipelines:
+Python camera clients for the Sentinel server.
 
-1. **facial-cam** — Viola–Jones crop → InsightFace `buffalo_s` → authorized / unauthorized
-2. **surveillance-cam** — optical flow → stable movers → DINOv3 → human / animal / unknown object
+1. **facial-cam** — Viola–Jones + `buffalo_s` → enroll / authorize against the API  
+2. **surveillance-cam** — optical flow + DINOv3 → motion alerts to the dashboard  
+
+Keys, server URL, and camera source are entered interactively (not as CLI flags).
 
 ## Setup
 
 ```bash
-cd sentinel
-python -m venv .venv
 source .venv/bin/activate
-
-# Facial recognition
-pip install -r facial-cam/requirements.txt
-
-# Surveillance (optical flow + DINOv3)
-pip install -r surveillance-cam/requirements.txt
+pip install -r cameras/facial-cam/requirements.txt
+pip install -r cameras/surveillance-cam/requirements.txt
 ```
+
+Start the API first (`cd server && npm run dev`).
+
+## Pair a camera
+
+1. In the dashboard, create a **facial** or **surveillance** camera and copy the access key.  
+2. On the device:
+
+```bash
+cd cameras
+python facial-cam/main.py claim
+python surveillance-cam/main.py claim
+```
+
+You will be prompted for the server URL and access key. Tokens are saved under `cameras/.tokens/`.
 
 ## Facial cam
 
 ```bash
-# Live recognition (exits after 3s continuous authorized/unauthorized)
-python facial-cam/main.py run --source 0
-
-# Enroll (asks admin username/password in the terminal)
-python facial-cam/main.py enroll --user alice --source 0
-python facial-cam/main.py enroll --user alice --image photo.jpg
+python facial-cam/main.py enroll   # prompts: server, access key (if needed), enroll key, source
+python facial-cam/main.py run      # prompts: offline?, server, source
 ```
-
-Gallery layout: `data/faces/authorized/<user_id>/*.jpg`
-
-On macOS, grant Camera access to Terminal/Cursor if webcam open fails.
 
 ## Surveillance cam
 
 ```bash
-python surveillance-cam/main.py --source path/to/video.mp4
-python surveillance-cam/main.py --source path/to/video.mp4 --save output/flow_dino.mp4
-python surveillance-cam/main.py --source 0
-```
-
-### MoCA optical-flow eval
-
-```bash
-python scripts/eval_moca_optical_flow.py
-python scripts/eval_moca_optical_flow.py --animals cat rat
+python surveillance-cam/main.py run   # prompts: offline?, source, server, access key (if needed)
 ```
