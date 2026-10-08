@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel"
+version = "0.2.0"
+description = "Facial recognition (Viola–Jones + buffalo_s) and optical-flow surveillance (DINOv3)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "PyYAML>=6.0",
+    "insightface>=0.7.3",
+    "onnxruntime>=1.16",
+    "Pillow>=10.0",
+    "timm>=1.0.20",
+    "huggingface_hub>=0.23",
+    "safetensors>=0.4",
+    "torch>=2.0",
+    "torchvision>=0.15",
+]
+
+[tool.setuptools]
+packages = []
