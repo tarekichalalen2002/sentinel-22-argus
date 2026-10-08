@@ -11,3 +11,5 @@ output/
 MoCa/
 *.zip
 data/
+server/.env
+server/node_modules/
